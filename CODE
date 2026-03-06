@@ -1,1 +1,722 @@
+############################################################
+# PROJECT: Morphometric prediction of pig body weight under
+#          BSF-based diets + simulation-based forecasting
+# AUTHOR: [Your Name]
+# DATE:   [Insert Date]
+#
+# PURPOSE:
+# 1. Clean and validate morphometric dataset
+# 2. Summarize BW and morphometric traits by diet
+# 3. Test treatment effects
+# 4. Identify the best morphometric predictors of BW
+# 5. Build prediction models
+# 6. Run mixed models if repeated measurements exist
+# 7. Run simulation-based forecasting across BSF inclusion levels
+# 8. Export tables and figures
+############################################################
 
+############################
+# 0. Load required packages
+############################
+
+required_packages <- c(
+  "tidyverse",
+  "janitor",
+  "readr",
+  "readxl",
+  "broom",
+  "broom.mixed",
+  "lme4",
+  "lmerTest",
+  "performance",
+  "MuMIn",
+  "car",
+  "rsample",
+  "yardstick",
+  "GGally",
+  "patchwork",
+  "scales"
+)
+
+# Install missing packages automatically
+installed <- rownames(installed.packages())
+for (pkg in required_packages) {
+  if (!pkg %in% installed) install.packages(pkg, dependencies = TRUE)
+}
+
+# Load packages
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+############################
+# 1. Set directories
+############################
+
+# EDIT THIS PATH
+data_file <- "data/pig_morphometrics.csv"
+# Example Excel alternative:
+# data_file <- "data/pig_morphometrics.xlsx"
+
+out_dir <- "outputs"
+fig_dir <- file.path(out_dir, "figures")
+tab_dir <- file.path(out_dir, "tables")
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(tab_dir, showWarnings = FALSE, recursive = TRUE)
+
+############################
+# 2. Import data
+############################
+
+# Read CSV or Excel depending on extension
+if (grepl("\\.csv$", data_file, ignore.case = TRUE)) {
+  dat_raw <- readr::read_csv(data_file, show_col_types = FALSE)
+} else if (grepl("\\.xlsx$", data_file, ignore.case = TRUE)) {
+  dat_raw <- readxl::read_excel(data_file)
+} else {
+  stop("Unsupported file format. Use .csv or .xlsx")
+}
+
+# Clean column names
+dat <- dat_raw %>%
+  janitor::clean_names()
+
+############################
+# 3. Inspect and validate columns
+############################
+
+# ---- IMPORTANT ----
+# Edit these names to match your real dataset if needed
+required_cols <- c(
+  "pig_id",
+  "diet",
+  "bsf_inclusion",
+  "body_weight",
+  "heart_girth",
+  "body_length"
+)
+
+missing_cols <- setdiff(required_cols, names(dat))
+if (length(missing_cols) > 0) {
+  stop(
+    paste0(
+      "The following required columns are missing from the dataset: ",
+      paste(missing_cols, collapse = ", "),
+      ".\nPlease rename your columns or update 'required_cols' in the script."
+    )
+  )
+}
+
+# Optional columns that may or may not exist
+optional_cols <- c(
+  "time_point",      # repeated measurement time
+  "age_days",
+  "sex",
+  "pen",
+  "height_withers",
+  "rump_height",
+  "chest_depth",
+  "paunch_girth",
+  "snout_length",
+  "ear_length"
+)
+
+available_optional <- optional_cols[optional_cols %in% names(dat)]
+
+############################
+# 4. Basic data cleaning
+############################
+
+# Convert key variables to appropriate data types
+dat <- dat %>%
+  mutate(
+    pig_id = as.factor(pig_id),
+    diet = as.factor(diet),
+    bsf_inclusion = as.numeric(bsf_inclusion),
+    body_weight = as.numeric(body_weight),
+    across(any_of(c(
+      "heart_girth", "body_length", "height_withers", "rump_height",
+      "chest_depth", "paunch_girth", "snout_length", "ear_length",
+      "age_days"
+    )), as.numeric)
+  )
+
+# Convert optional grouping variables if present
+if ("pen" %in% names(dat)) {
+  dat <- dat %>% mutate(pen = as.factor(pen))
+}
+
+if ("sex" %in% names(dat)) {
+  dat <- dat %>% mutate(sex = as.factor(sex))
+}
+
+if ("time_point" %in% names(dat)) {
+  # Keep as factor if categorical week labels; numeric if true time values
+  # Here we preserve as factor by default
+  dat <- dat %>% mutate(time_point = as.factor(time_point))
+}
+
+############################
+# 5. Define morphometric variables available
+############################
+
+morpho_vars <- c(
+  "heart_girth",
+  "body_length",
+  "height_withers",
+  "rump_height",
+  "chest_depth",
+  "paunch_girth",
+  "snout_length",
+  "ear_length"
+)
+
+morpho_vars <- morpho_vars[morpho_vars %in% names(dat)]
+
+if (length(morpho_vars) < 2) {
+  stop("At least two morphometric variables are needed for this workflow.")
+}
+
+############################
+# 6. Missing data check
+############################
+
+missing_summary <- dat %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(cols = everything(),
+               names_to = "variable",
+               values_to = "n_missing") %>%
+  arrange(desc(n_missing))
+
+write_csv(missing_summary, file.path(tab_dir, "missing_data_summary.csv"))
+
+# Keep complete cases for modeling variables only
+model_vars <- unique(c(
+  "pig_id", "diet", "bsf_inclusion", "body_weight",
+  morpho_vars, available_optional
+))
+
+dat_model <- dat %>%
+  select(any_of(model_vars)) %>%
+  drop_na(body_weight, heart_girth, body_length)
+
+############################
+# 7. Descriptive statistics
+############################
+
+# Descriptive summary by diet
+desc_by_diet <- dat_model %>%
+  group_by(diet) %>%
+  summarise(
+    n = n(),
+    bw_mean = mean(body_weight, na.rm = TRUE),
+    bw_sd   = sd(body_weight, na.rm = TRUE),
+    bw_se   = bw_sd / sqrt(n),
+    across(all_of(morpho_vars),
+           list(mean = ~mean(.x, na.rm = TRUE),
+                sd   = ~sd(.x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}"),
+    .groups = "drop"
+  )
+
+write_csv(desc_by_diet, file.path(tab_dir, "descriptive_stats_by_diet.csv"))
+
+############################
+# 8. Visualize BW by diet
+############################
+
+p_bw_diet <- ggplot(dat_model, aes(x = diet, y = body_weight)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.6) +
+  labs(
+    title = "Body weight by dietary treatment",
+    x = "Dietary treatment",
+    y = "Body weight"
+  ) +
+  theme_bw()
+
+ggsave(
+  filename = file.path(fig_dir, "body_weight_by_diet.png"),
+  plot = p_bw_diet,
+  width = 8, height = 6, dpi = 300
+)
+
+############################
+# 9. Morphometric trait plots by diet
+############################
+
+dat_long <- dat_model %>%
+  pivot_longer(
+    cols = all_of(morpho_vars),
+    names_to = "trait",
+    values_to = "value"
+  )
+
+p_traits <- ggplot(dat_long, aes(x = diet, y = value)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.4) +
+  facet_wrap(~trait, scales = "free_y") +
+  labs(
+    title = "Morphometric traits across dietary groups",
+    x = "Dietary treatment",
+    y = "Measurement value"
+  ) +
+  theme_bw()
+
+ggsave(
+  filename = file.path(fig_dir, "morphometric_traits_by_diet.png"),
+  plot = p_traits,
+  width = 12, height = 9, dpi = 300
+)
+
+############################
+# 10. Correlation analysis
+############################
+
+corr_vars <- c("body_weight", morpho_vars)
+
+corr_dat <- dat_model %>%
+  select(all_of(corr_vars)) %>%
+  drop_na()
+
+corr_mat <- cor(corr_dat, use = "pairwise.complete.obs", method = "pearson")
+
+write.csv(corr_mat, file.path(tab_dir, "correlation_matrix.csv"), row.names = TRUE)
+
+# Correlation heatmap
+corr_df <- as.data.frame(as.table(corr_mat))
+names(corr_df) <- c("Var1", "Var2", "Correlation")
+
+p_corr <- ggplot(corr_df, aes(Var1, Var2, fill = Correlation)) +
+  geom_tile() +
+  geom_text(aes(label = round(Correlation, 2)), size = 3) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  labs(
+    title = "Correlation matrix of BW and morphometric traits",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(
+  filename = file.path(fig_dir, "correlation_heatmap.png"),
+  plot = p_corr,
+  width = 9, height = 7, dpi = 300
+)
+
+############################
+# 11. Univariate screening models
+############################
+
+fit_univariate_model <- function(var_name, data) {
+  fm <- as.formula(paste("body_weight ~", var_name))
+  mod <- lm(fm, data = data)
+  
+  tibble(
+    predictor = var_name,
+    r_squared = summary(mod)$r.squared,
+    adj_r_squared = summary(mod)$adj.r.squared,
+    rmse = sqrt(mean(residuals(mod)^2)),
+    aic = AIC(mod),
+    slope = coef(mod)[2],
+    p_value = broom::tidy(mod)$p.value[2]
+  )
+}
+
+univariate_results <- map_dfr(morpho_vars, fit_univariate_model, data = dat_model) %>%
+  arrange(desc(adj_r_squared))
+
+write_csv(univariate_results, file.path(tab_dir, "univariate_bw_prediction_models.csv"))
+
+############################
+# 12. Scatterplots for top predictors
+############################
+
+top_predictors <- univariate_results %>%
+  slice_head(n = min(3, n())) %>%
+  pull(predictor)
+
+for (var in top_predictors) {
+  p <- ggplot(dat_model, aes_string(x = var, y = "body_weight", color = "diet")) +
+    geom_point(alpha = 0.7) +
+    geom_smooth(method = "lm", se = TRUE) +
+    labs(
+      title = paste("Body weight versus", gsub("_", " ", var)),
+      x = gsub("_", " ", var),
+      y = "Body weight"
+    ) +
+    theme_bw()
+  
+  ggsave(
+    filename = file.path(fig_dir, paste0("scatter_bw_", var, ".png")),
+    plot = p,
+    width = 8, height = 6, dpi = 300
+  )
+}
+
+############################
+# 13. Multicollinearity check
+############################
+
+# Build a candidate full model using available key predictors
+candidate_predictors <- c("heart_girth", "body_length", "height_withers", "chest_depth")
+candidate_predictors <- candidate_predictors[candidate_predictors %in% names(dat_model)]
+
+if (length(candidate_predictors) >= 2) {
+  full_formula <- as.formula(
+    paste("body_weight ~", paste(candidate_predictors, collapse = " + "))
+  )
+  
+  full_lm <- lm(full_formula, data = dat_model)
+  vif_table <- tibble(
+    predictor = names(car::vif(full_lm)),
+    vif = as.numeric(car::vif(full_lm))
+  )
+  
+  write_csv(vif_table, file.path(tab_dir, "vif_table.csv"))
+}
+
+############################
+# 14. Candidate BW prediction models
+############################
+
+candidate_formulas <- list(
+  model_1 = body_weight ~ heart_girth,
+  model_2 = body_weight ~ heart_girth + body_length,
+  model_3 = body_weight ~ heart_girth + body_length + height_withers,
+  model_4 = body_weight ~ heart_girth + body_length + diet,
+  model_5 = body_weight ~ heart_girth * diet + body_length
+)
+
+# Keep only formulas whose variables all exist in the data
+formula_is_valid <- function(fm, data) {
+  all(all.vars(fm) %in% names(data))
+}
+
+candidate_formulas <- candidate_formulas[
+  map_lgl(candidate_formulas, formula_is_valid, data = dat_model)
+]
+
+fit_and_summarize_lm <- function(fm, model_name, data) {
+  mod <- lm(fm, data = data)
+  
+  tibble(
+    model = model_name,
+    formula = deparse(fm),
+    n = nobs(mod),
+    r_squared = summary(mod)$r.squared,
+    adj_r_squared = summary(mod)$adj.r.squared,
+    rmse = sqrt(mean(residuals(mod)^2)),
+    mae = mean(abs(residuals(mod))),
+    aic = AIC(mod)
+  )
+}
+
+model_comparison <- imap_dfr(candidate_formulas, ~fit_and_summarize_lm(.x, .y, dat_model)) %>%
+  arrange(rmse, aic)
+
+write_csv(model_comparison, file.path(tab_dir, "candidate_model_comparison.csv"))
+
+# Save best model object
+best_model_name <- model_comparison %>% slice(1) %>% pull(model)
+best_lm <- lm(candidate_formulas[[best_model_name]], data = dat_model)
+
+capture.output(summary(best_lm), file = file.path(tab_dir, "best_lm_summary.txt"))
+write_csv(broom::tidy(best_lm), file.path(tab_dir, "best_lm_coefficients.csv"))
+write_csv(broom::glance(best_lm), file.path(tab_dir, "best_lm_fit_stats.csv"))
+
+############################
+# 15. K-fold cross-validation for candidate linear models
+############################
+
+set.seed(123)
+
+# Create 5-fold cross-validation splits
+folds <- rsample::vfold_cv(dat_model, v = 5)
+
+cv_results <- map_dfr(names(candidate_formulas), function(model_name) {
+  fm <- candidate_formulas[[model_name]]
+  
+  fold_metrics <- map_dfr(seq_along(folds$splits), function(i) {
+    split <- folds$splits[[i]]
+    train_dat <- analysis(split)
+    test_dat  <- assessment(split)
+    
+    mod <- lm(fm, data = train_dat)
+    preds <- predict(mod, newdata = test_dat)
+    
+    tibble(
+      model = model_name,
+      fold = i,
+      rmse = yardstick::rmse_vec(truth = test_dat$body_weight, estimate = preds),
+      mae  = yardstick::mae_vec(truth = test_dat$body_weight, estimate = preds),
+      rsq  = yardstick::rsq_vec(truth = test_dat$body_weight, estimate = preds)
+    )
+  })
+  
+  fold_metrics
+})
+
+cv_summary <- cv_results %>%
+  group_by(model) %>%
+  summarise(
+    cv_rmse = mean(rmse, na.rm = TRUE),
+    cv_mae = mean(mae, na.rm = TRUE),
+    cv_rsq = mean(rsq, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(cv_rmse)
+
+write_csv(cv_results, file.path(tab_dir, "cv_fold_results.csv"))
+write_csv(cv_summary, file.path(tab_dir, "cv_summary.csv"))
+
+############################
+# 16. Prediction plot for best model
+############################
+
+dat_model <- dat_model %>%
+  mutate(
+    predicted_bw = predict(best_lm, newdata = dat_model),
+    residuals_bw = body_weight - predicted_bw
+  )
+
+p_pred <- ggplot(dat_model, aes(x = body_weight, y = predicted_bw, color = diet)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "Observed versus predicted body weight",
+    x = "Observed BW",
+    y = "Predicted BW"
+  ) +
+  theme_bw()
+
+ggsave(
+  filename = file.path(fig_dir, "observed_vs_predicted_bw.png"),
+  plot = p_pred,
+  width = 8, height = 6, dpi = 300
+)
+
+############################
+# 17. Diagnostic plots for best linear model
+############################
+
+png(file.path(fig_dir, "best_lm_diagnostics.png"), width = 1200, height = 1200, res = 150)
+par(mfrow = c(2, 2))
+plot(best_lm)
+dev.off()
+
+############################
+# 18. Mixed models (only if repeated measures exist)
+############################
+
+if ("time_point" %in% names(dat_model)) {
+  
+  # Basic mixed model
+  mixed_formula <- as.formula(
+    "body_weight ~ heart_girth + body_length + diet + time_point + (1 | pig_id)"
+  )
+  
+  # Add pen random effect if available
+  if ("pen" %in% names(dat_model)) {
+    mixed_formula <- as.formula(
+      "body_weight ~ heart_girth + body_length + diet + time_point + (1 | pen) + (1 | pig_id)"
+    )
+  }
+  
+  mixed_model <- lmer(mixed_formula, data = dat_model, REML = FALSE)
+  
+  capture.output(summary(mixed_model),
+                 file = file.path(tab_dir, "mixed_model_summary.txt"))
+  
+  write_csv(broom.mixed::tidy(mixed_model),
+            file.path(tab_dir, "mixed_model_coefficients.csv"))
+  
+  mixed_fit <- performance::model_performance(mixed_model)
+  write.csv(as.data.frame(mixed_fit),
+            file.path(tab_dir, "mixed_model_fit_stats.csv"),
+            row.names = FALSE)
+}
+
+############################
+# 19. Allometric analysis
+############################
+
+# Example: log(BW) ~ log(heart_girth)
+# Only keep positive values
+allom_dat <- dat_model %>%
+  filter(body_weight > 0, heart_girth > 0)
+
+allom_model <- lm(log(body_weight) ~ log(heart_girth), data = allom_dat)
+
+capture.output(summary(allom_model),
+               file = file.path(tab_dir, "allometric_model_summary.txt"))
+
+write_csv(broom::tidy(allom_model),
+          file.path(tab_dir, "allometric_model_coefficients.csv"))
+
+p_allom <- ggplot(allom_dat, aes(x = heart_girth, y = body_weight, color = diet)) +
+  geom_point(alpha = 0.7) +
+  scale_x_log10() +
+  scale_y_log10() +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(
+    title = "Allometric relationship between heart girth and body weight",
+    x = "Heart girth (log scale)",
+    y = "Body weight (log scale)"
+  ) +
+  theme_bw()
+
+ggsave(
+  filename = file.path(fig_dir, "allometric_heart_girth_bw.png"),
+  plot = p_allom,
+  width = 8, height = 6, dpi = 300
+)
+
+############################
+# 20. Simulation-based forecasting
+############################
+
+# This section simulates expected BW across BSF inclusion levels
+# using the best prediction model and observed variability in key
+# morphometric traits.
+
+set.seed(123)
+
+# Select a model for simulation. Prefer a model with diet/inclusion
+# if such a model is among candidate formulas. Otherwise use best_lm.
+sim_model <- best_lm
+
+# Define scenarios based on BSF inclusion levels
+# Adjust these to match your real experimental levels
+sim_scenarios <- tibble(
+  scenario = c("0%", "25%", "50%", "75%", "100%"),
+  bsf_inclusion = c(0, 25, 50, 75, 100)
+)
+
+# Build simulation template from observed morphometric distributions
+# Here we use heart girth and body length if available
+sim_n <- 5000
+
+# Helper to simulate from empirical mean and SD
+simulate_trait <- function(x, n) {
+  mu <- mean(x, na.rm = TRUE)
+  sd_x <- sd(x, na.rm = TRUE)
+  rnorm(n, mean = mu, sd = sd_x)
+}
+
+# Create scenario-specific morphometric distributions if enough data exist
+sim_data <- map_dfr(seq_len(nrow(sim_scenarios)), function(i) {
+  
+  incl <- sim_scenarios$bsf_inclusion[i]
+  scen <- sim_scenarios$scenario[i]
+  
+  # If the observed dataset contains this inclusion level, use it;
+  # otherwise use the whole dataset as a fallback.
+  obs_sub <- dat_model %>%
+    filter(!is.na(bsf_inclusion))
+  
+  if (incl %in% obs_sub$bsf_inclusion) {
+    obs_sub <- obs_sub %>% filter(bsf_inclusion == incl)
+  }
+  
+  if (nrow(obs_sub) < 5) {
+    obs_sub <- dat_model
+  }
+  
+  out <- tibble(
+    scenario = scen,
+    bsf_inclusion = incl,
+    heart_girth = simulate_trait(obs_sub$heart_girth, sim_n),
+    body_length = simulate_trait(obs_sub$body_length, sim_n)
+  )
+  
+  # Add optional predictors if required by the chosen model
+  if ("height_withers" %in% all.vars(formula(sim_model))) {
+    if ("height_withers" %in% names(obs_sub)) {
+      out$height_withers <- simulate_trait(obs_sub$height_withers, sim_n)
+    } else {
+      out$height_withers <- mean(dat_model$height_withers, na.rm = TRUE)
+    }
+  }
+  
+  # Add diet if required by the chosen model
+  if ("diet" %in% all.vars(formula(sim_model))) {
+    # Choose the most common diet label associated with this inclusion level if possible
+    if ("diet" %in% names(obs_sub)) {
+      top_diet <- obs_sub %>%
+        count(diet, sort = TRUE) %>%
+        slice(1) %>%
+        pull(diet)
+      out$diet <- factor(top_diet, levels = levels(dat_model$diet))
+    } else {
+      out$diet <- factor(levels(dat_model$diet)[1], levels = levels(dat_model$diet))
+    }
+  }
+  
+  out
+})
+
+# Predict simulated BW
+sim_data$predicted_bw <- predict(sim_model, newdata = sim_data)
+
+# Remove biologically impossible predictions
+sim_data <- sim_data %>%
+  filter(predicted_bw > 0)
+
+# Summarize simulation output
+sim_summary <- sim_data %>%
+  group_by(scenario, bsf_inclusion) %>%
+  summarise(
+    mean_pred_bw = mean(predicted_bw, na.rm = TRUE),
+    sd_pred_bw = sd(predicted_bw, na.rm = TRUE),
+    p2_5 = quantile(predicted_bw, 0.025, na.rm = TRUE),
+    p50 = quantile(predicted_bw, 0.50, na.rm = TRUE),
+    p97_5 = quantile(predicted_bw, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(sim_summary, file.path(tab_dir, "simulation_summary.csv"))
+
+# Plot simulation distributions
+p_sim_density <- ggplot(sim_data, aes(x = predicted_bw, color = scenario)) +
+  geom_density(linewidth = 1) +
+  labs(
+    title = "Simulated body weight distributions under BSF inclusion scenarios",
+    x = "Predicted body weight",
+    y = "Density"
+  ) +
+  theme_bw()
+
+ggsave(
+  filename = file.path(fig_dir, "simulation_density_bw.png"),
+  plot = p_sim_density,
+  width = 9, height = 6, dpi = 300
+)
+
+# Plot mean and uncertainty intervals
+p_sim_ci <- ggplot(sim_summary, aes(x = bsf_inclusion, y = mean_pred_bw)) +
+  geom_line() +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = p2_5, ymax = p97_5), width = 3) +
+  scale_x_continuous(breaks = sim_summary$bsf_inclusion) +
+  labs(
+    title = "Forecast body weight across BSF inclusion levels",
+    x = "BSF larvae meal inclusion level (%)",
+    y = "Predicted body weight"
+  ) +
+  theme_bw()
+
+ggsave(
+  filename = file.path(fig_dir, "simulation_forecast_bw.png"),
+  plot = p_sim_ci,
+  width = 8, height = 6, dpi = 300
+)
+
+############################
+# 21. Export session info
+############################
+
+capture.output(sessionInfo(), file = file.path(out_dir, "session_info.txt"))
+
+cat("Analysis complete. Outputs saved in:", out_dir, "\n")
